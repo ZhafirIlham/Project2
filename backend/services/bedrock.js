@@ -4,20 +4,23 @@
 // Bedrock Service (R3.2, R3.3, R4.1, R8.2)
 //
 // Modul ini mengisolasi seluruh integrasi AWS Bedrock di satu tempat, terpisah
-// dari layer route dan konfigurasi (lihat design.md — "Backend — Modul Internal").
+// dari layer route dan konfigurasi (lihat design.md - "Backend - Modul Internal").
 //
-// Kontrak kesalahan (dibaca oleh routes/chat.js pada Task 3):
-//   Fungsi `generateReply` akan MELEMPAR error bertipe (lihat BedrockServiceError)
-//   dengan properti `kind` yang membedakan penyebab kegagalan:
-//     - kind === 'timeout'  -> pemanggilan Bedrock melewati batas 30 detik
-//                              (route memetakan ke UPSTREAM_TIMEOUT / 504, R4.1)
-//     - kind === 'upstream' -> kegagalan SDK/model atau respons tak terurai
-//                              (route memetakan ke UPSTREAM_ERROR / 502, R4.1)
-//   Pada keberhasilan, fungsi mengembalikan string `reply` (teks jawaban model).
+// Dukungan model:
+//   Payload & parsing respons dipilih berdasarkan BEDROCK_MODEL_ID:
+//     - Model Amazon Nova (id mengandung 'nova', mis. us.amazon.nova-lite-v1:0)
+//       memakai skema Nova: messages[].content[].text + inferenceConfig, dan
+//       jawaban diambil dari output.message.content[0].text.
+//     - Model lain diperlakukan sebagai Anthropic Claude Messages API:
+//       anthropic_version + messages[{role,content:string}], jawaban dari
+//       content[0].text.
+//   Dengan begitu kode tetap bekerja bila pemilik berganti antara Nova & Claude.
 //
-// Pendekatan "typed error" dipilih (ketimbang discriminated result) agar jalur
-// sukses hanya mengembalikan string `reply` dan pemanggil cukup `try/catch` lalu
-// bercabang berdasarkan `error.kind`.
+// Kontrak kesalahan (dibaca oleh routes/chat.js):
+//   `generateReply` MELEMPAR BedrockServiceError dengan properti `kind`:
+//     - kind === 'timeout'  -> pemanggilan melewati batas 30 detik  -> 504
+//     - kind === 'upstream' -> kegagalan SDK/model atau respons tak terurai -> 502
+//   Pada keberhasilan, mengembalikan string `reply`.
 // =============================================================================
 
 const {
@@ -35,7 +38,6 @@ const MAX_TOKENS = 1024;
 
 /**
  * Kesalahan layanan Bedrock yang dapat dibedakan oleh pemanggil.
- *
  * @property {'timeout' | 'upstream'} kind - kategori kegagalan.
  * @property {unknown} [cause] - penyebab asli (error SDK), untuk logging.
  */
@@ -54,17 +56,15 @@ class BedrockServiceError extends Error {
 }
 
 // Klien Bedrock dibuat sekali per proses dan diisolasi di modul ini.
-// Region diambil dari config; KREDENSIAL TIDAK di-hardcode — dibiarkan mengikuti
+// Region diambil dari config; KREDENSIAL TIDAK di-hardcode - dibiarkan mengikuti
 // default credential provider chain AWS SDK (env, shared config, IAM role).
-// Pembuatan klien ini tidak melakukan panggilan jaringan apa pun saat modul
-// dimuat (require), sehingga aman di-`require` tanpa efek samping jaringan.
+// Variabel AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_REGION dari .env (dimuat
+// oleh dotenv di config.js) otomatis dipakai oleh SDK. Pembuatan klien ini tidak
+// melakukan panggilan jaringan saat modul dimuat, sehingga aman di-require.
 let client = null;
 
 /**
  * Mengembalikan instance BedrockRuntimeClient (lazy singleton).
- * Dibuat saat pertama kali dibutuhkan agar `require('./services/bedrock')`
- * tidak memicu inisialisasi klien lebih awal dari yang diperlukan.
- *
  * @returns {BedrockRuntimeClient}
  */
 function getClient() {
@@ -75,23 +75,29 @@ function getClient() {
 }
 
 /**
- * Menyusun body payload permintaan untuk model Bedrock.
- *
- * CATATAN MODEL: Payload ini mengasumsikan model yang kompatibel dengan
- * Anthropic Claude Messages API (format umum untuk model teks di Bedrock):
- *   {
- *     anthropic_version: "bedrock-2023-05-31",
- *     max_tokens: <n>,
- *     messages: [{ role: "user", content: <pesan siswa> }]
- *   }
- * Jika BEDROCK_MODEL_ID merujuk ke keluarga model lain (mis. Titan, Llama),
- * bentuk payload dan parsing respons di bawah perlu disesuaikan dengan skema
- * model tersebut.
- *
+ * Deteksi apakah model id merujuk ke keluarga Amazon Nova.
+ * @param {string} modelId
+ * @returns {boolean}
+ */
+function isNovaModel(modelId) {
+  return typeof modelId === 'string' && modelId.toLowerCase().includes('nova');
+}
+
+/**
+ * Menyusun body payload permintaan sesuai keluarga model.
  * @param {string} message - pesan Siswa.
+ * @param {string} modelId - BEDROCK_MODEL_ID.
  * @returns {string} JSON string body permintaan.
  */
-function buildPayload(message) {
+function buildPayload(message, modelId) {
+  if (isNovaModel(modelId)) {
+    // Skema Amazon Nova (nova-lite/micro/pro).
+    return JSON.stringify({
+      messages: [{ role: 'user', content: [{ text: message }] }],
+      inferenceConfig: { maxTokens: MAX_TOKENS },
+    });
+  }
+  // Skema Anthropic Claude Messages API.
   return JSON.stringify({
     anthropic_version: 'bedrock-2023-05-31',
     max_tokens: MAX_TOKENS,
@@ -100,21 +106,18 @@ function buildPayload(message) {
 }
 
 /**
- * Mengurai respons InvokeModelCommand menjadi teks jawaban (`reply`).
- *
- * Respons Bedrock membawa body sebagai Uint8Array; body di-decode ke teks,
- * di-JSON.parse, lalu teks asisten diekstrak. Untuk Claude Messages, teks ada
- * di `responseJson.content[0].text`. Parsing dilakukan secara defensif: respons
- * yang tidak dapat diurai atau kosong diperlakukan sebagai kegagalan upstream.
+ * Mengurai respons InvokeModelCommand menjadi teks jawaban (`reply`), sesuai
+ * keluarga model. Parsing dilakukan defensif: respons tak terurai/kosong
+ * diperlakukan sebagai kegagalan upstream.
  *
  * @param {{ body?: Uint8Array }} response - keluaran dari client.send.
- * @returns {string} teks jawaban model (reply) yang sudah terjamin non-kosong.
+ * @param {string} modelId - BEDROCK_MODEL_ID.
+ * @returns {string} teks jawaban model (reply) yang terjamin non-kosong.
  * @throws {BedrockServiceError} kind 'upstream' bila respons tak terurai/kosong.
  */
-function parseReply(response) {
+function parseReply(response, modelId) {
   let text;
   try {
-    // body dapat berupa Uint8Array; dekode ke string UTF-8.
     const raw = response && response.body;
     if (!raw) {
       throw new Error('Respons Bedrock tidak memiliki body.');
@@ -139,14 +142,30 @@ function parseReply(response) {
     );
   }
 
-  // Ekstraksi defensif teks asisten dari skema Claude Messages.
-  const reply =
-    json &&
-    Array.isArray(json.content) &&
-    json.content[0] &&
-    typeof json.content[0].text === 'string'
-      ? json.content[0].text
-      : null;
+  let reply = null;
+  if (isNovaModel(modelId)) {
+    // Nova: output.message.content[0].text
+    const content =
+      json &&
+      json.output &&
+      json.output.message &&
+      Array.isArray(json.output.message.content)
+        ? json.output.message.content
+        : null;
+    if (content && content[0] && typeof content[0].text === 'string') {
+      reply = content[0].text;
+    }
+  } else {
+    // Claude: content[0].text
+    if (
+      json &&
+      Array.isArray(json.content) &&
+      json.content[0] &&
+      typeof json.content[0].text === 'string'
+    ) {
+      reply = json.content[0].text;
+    }
+  }
 
   if (reply === null || reply.trim() === '') {
     throw new BedrockServiceError(
@@ -160,22 +179,20 @@ function parseReply(response) {
 
 /**
  * Memanggil Bedrock untuk menghasilkan jawaban atas pesan Siswa.
- *
- * Menerapkan timeout 30 detik menggunakan AbortController yang diteruskan ke
- * `client.send(command, { abortSignal })`; sebuah `setTimeout(30000)` memicu
- * abort bila model belum merespons. Kondisi abort/timeout dipetakan ke error
- * `kind: 'timeout'`; kegagalan SDK/model lain dipetakan ke `kind: 'upstream'`.
+ * Timeout 30 detik via AbortController; abort/timeout -> kind 'timeout',
+ * kegagalan lain -> kind 'upstream'.
  *
  * @param {string} message - pesan Siswa (sudah divalidasi oleh layer route).
  * @returns {Promise<string>} teks jawaban model (reply).
  * @throws {BedrockServiceError} dengan `kind` 'timeout' atau 'upstream'.
  */
 async function generateReply(message) {
+  const modelId = config.BEDROCK_MODEL_ID;
   const command = new InvokeModelCommand({
-    modelId: config.BEDROCK_MODEL_ID,
+    modelId,
     contentType: 'application/json',
     accept: 'application/json',
-    body: buildPayload(message),
+    body: buildPayload(message, modelId),
   });
 
   const controller = new AbortController();
@@ -191,7 +208,6 @@ async function generateReply(message) {
       abortSignal: controller.signal,
     });
   } catch (err) {
-    // Jika timer kita yang memicu abort, ini adalah kondisi timeout (R3.2/R4.1).
     if (timedOut || isAbortError(err)) {
       throw new BedrockServiceError(
         'timeout',
@@ -199,7 +215,6 @@ async function generateReply(message) {
         err,
       );
     }
-    // Kegagalan SDK/model lain -> upstream error (R4.1).
     throw new BedrockServiceError(
       'upstream',
       'Layanan AI mengembalikan kegagalan saat memproses permintaan.',
@@ -209,14 +224,11 @@ async function generateReply(message) {
     clearTimeout(timer);
   }
 
-  // Parsing respons; dapat melempar BedrockServiceError kind 'upstream'.
-  return parseReply(response);
+  return parseReply(response, modelId);
 }
 
 /**
  * Mendeteksi apakah sebuah error merupakan pembatalan (abort).
- * SDK AWS/Node umumnya menandai abort dengan `name === 'AbortError'`.
- *
  * @param {unknown} err
  * @returns {boolean}
  */
